@@ -1,14 +1,13 @@
 """
 Backend API for the romantic chatbot.
-Frontend sends chat content; API returns the bot's reply.
+Frontend sends chat content; 
+API returns the bot's reply.
 """
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-from romatic_chatbot import chat
 
 
 # --- Request/Response models ---
@@ -58,8 +57,14 @@ def post_chat(body: ChatRequest):
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
     try:
+        from romatic_chatbot import chat
         history, reply = chat(body.message.strip(), history=body.history)
         return ChatResponse(reply=reply, history=history)
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat model not available. Install torch and transformers: pip install torch transformers",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
