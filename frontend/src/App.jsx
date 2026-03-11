@@ -1,17 +1,48 @@
 import { useState, useRef, useEffect } from "react";
 
 const API_BASE = "/api";
+const SESSION_KEY = "romantic_chat_session_id";
+
+function getOrCreateSessionId() {
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id && typeof crypto !== "undefined" && crypto.randomUUID) {
+    id = crypto.randomUUID();
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  if (!id) {
+    id = "session-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
+}
 
 export default function App() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [sessionId, setSessionId] = useState(null);
   const messagesEndRef = useRef(null);
 
   const messages = history
     ? history.filter((m) => m.role !== "system")
     : [];
+
+  useEffect(() => {
+    setSessionId(getOrCreateSessionId());
+  }, []);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    fetch(`${API_BASE}/history?session_id=${encodeURIComponent(sessionId)}`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.history && data.history.length > 0) {
+          setHistory(data.history);
+        }
+      })
+      .catch(() => {});
+  }, [sessionId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -25,11 +56,17 @@ export default function App() {
     setError(null);
     setInput("");
 
+    if (!sessionId) {
+      setError("Session not ready. Please wait.");
+      setInput(text);
+      setLoading(false);
+      return;
+    }
     try {
       const res = await fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, history }),
+        body: JSON.stringify({ message: text, session_id: sessionId }),
       });
 
       if (!res.ok) {
@@ -39,6 +76,7 @@ export default function App() {
 
       const data = await res.json();
       setHistory(data.history);
+      if (data.session_id) setSessionId(data.session_id);
     } catch (e) {
       setError(e.message);
       setInput(text);

@@ -1,0 +1,12 @@
+# SQLite chat history (per-environment)
+chat_history.db
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Frontend
+node_modules/
