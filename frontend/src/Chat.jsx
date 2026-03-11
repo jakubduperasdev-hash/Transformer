@@ -8,6 +8,7 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [streamingReply, setStreamingReply] = useState("");
   const [error, setError] = useState(null);
   const [user, setUser] = useState(null);
   const messagesEndRef = useRef(null);
@@ -52,7 +53,7 @@ export default function Chat() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, loading]);
+  }, [messages.length, loading, streamingReply]);
 
   async function handleSend() {
     const text = input.trim();
@@ -60,10 +61,16 @@ export default function Chat() {
 
     setLoading(true);
     setError(null);
+    setStreamingReply("");
     setInput("");
+    // Show user message immediately
+    setHistory((prev) => [
+      ...(prev || []).filter((m) => m.role !== "system"),
+      { role: "user", content: text },
+    ]);
 
     try {
-      const res = await fetch(`${API_BASE}/chat`, {
+      const res = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ message: text }),
@@ -79,13 +86,44 @@ export default function Chat() {
         throw new Error(err.detail || "Request failed");
       }
 
-      const data = await res.json();
-      setHistory(data.history);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const data = JSON.parse(line);
+            if (data.error) throw new Error(data.error);
+            if (data.chunk !== undefined) setStreamingReply((s) => s + data.chunk);
+            if (data.done && data.history) setHistory(data.history);
+          } catch (e) {
+            if (e instanceof SyntaxError) continue;
+            throw e;
+          }
+        }
+      }
+      if (buffer.trim()) {
+        try {
+          const data = JSON.parse(buffer);
+          if (data.error) throw new Error(data.error);
+          if (data.chunk !== undefined) setStreamingReply((s) => s + data.chunk);
+          if (data.done && data.history) setHistory(data.history);
+        } catch (e) {
+          if (!(e instanceof SyntaxError)) throw e;
+        }
+      }
     } catch (e) {
       setError(e.message);
-      setInput(text);
+      setHistory((prev) => prev && prev.length > 0 ? prev.slice(0, -1) : prev);
     } finally {
       setLoading(false);
+      setStreamingReply("");
     }
   }
 
@@ -134,7 +172,9 @@ export default function Chat() {
         {loading && (
           <div className="message message--assistant">
             <span className="message-role">Bot</span>
-            <p className="message-content typing">...</p>
+            <p className="message-content">
+              {streamingReply || <span className="typing">...</span>}
+            </p>
           </div>
         )}
         <div ref={messagesEndRef} aria-hidden="true" />

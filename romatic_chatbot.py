@@ -1,5 +1,6 @@
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from threading import Thread
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 # Pick an instruct/chat model (small example; use what fits your GPU)
 model_id = "Qwen/Qwen2.5-0.5B-Instruct"  # or "meta-llama/Meta-Llama-3-8B-Instruct", etc.
@@ -63,6 +64,60 @@ def chat(user_message: str, history: list = None) -> tuple[list, str]:
     # Return full history for next turn and for saving to DB
     full_history = messages + [{"role": "assistant", "content": assistant_text}]
     return full_history, assistant_text
+
+
+def chat_stream(user_message: str, history: list = None):
+    """
+    Stream the model reply token-by-token. Yields text chunks, then (full_history, full_reply).
+    Run generation in a thread; consume streamer on main thread.
+    """
+    model, tokenizer = _get_model_and_tokenizer()
+
+    if history is None or len(history) == 0:
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]
+    else:
+        messages = list(history)
+        if messages[0].get("role") != "system":
+            messages = [{"role": "system", "content": system_prompt}] + messages
+        messages.append({"role": "user", "content": user_message})
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    input_length = inputs.input_ids.shape[1]
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+    gen_kwargs = {
+        **inputs,
+        "max_new_tokens": 256,
+        "do_sample": True,
+        "temperature": 0.8,
+        "pad_token_id": tokenizer.eos_token_id,
+        "streamer": streamer,
+    }
+
+    full_reply_parts = []
+
+    def run_generate():
+        with torch.no_grad():
+            model.generate(**gen_kwargs)
+
+    thread = Thread(target=run_generate)
+    thread.start()
+    for token in streamer:
+        full_reply_parts.append(token)
+        yield token
+    thread.join()
+
+    assistant_text = "".join(full_reply_parts).strip()
+    full_history = messages + [{"role": "assistant", "content": assistant_text}]
+    yield (full_history, assistant_text)  # final yield: consumer checks type
+
 
 if __name__ == "__main__":
     history, reply = chat("Hey, I had a rough day.")

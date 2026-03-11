@@ -6,8 +6,10 @@ import os
 import sqlite3
 from contextlib import asynccontextmanager
 
+import json
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -198,6 +200,48 @@ def post_chat(body: ChatRequest, current_user: dict = Depends(get_current_user))
         ],
     )
     return ChatResponse(reply=reply, history=history)
+
+
+@api.post("/chat/stream")
+def post_chat_stream(body: ChatRequest, current_user: dict = Depends(get_current_user)):
+    """Stream the reply token-by-token (NDJSON: each line is {"chunk": "..."} or {"done": true, "history": [...]})."""
+    if not body.message or not body.message.strip():
+        raise HTTPException(status_code=400, detail="message must be non-empty")
+    try:
+        from romatic_chatbot import chat_stream
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="Chat model not available. Install torch and transformers.",
+        )
+    user_id = current_user["id"]
+    history = db.get_history_by_user(user_id)
+    if not history:
+        history = None
+
+    def generate():
+        try:
+            for value in chat_stream(body.message.strip(), history=history):
+                if isinstance(value, tuple):
+                    full_history, full_reply = value
+                    db.append_messages_for_user(
+                        user_id,
+                        [
+                            {"role": "user", "content": body.message.strip()},
+                            {"role": "assistant", "content": full_reply},
+                        ],
+                    )
+                    yield json.dumps({"done": True, "history": full_history}) + "\n"
+                else:
+                    yield json.dumps({"chunk": value}) + "\n"
+        except Exception as e:
+            yield json.dumps({"error": str(e)}) + "\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 app.include_router(api)
