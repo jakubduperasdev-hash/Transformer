@@ -20,8 +20,12 @@ body {
 }
 
 .header {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: 1rem;
+  flex-wrap: wrap;
+  gap: 0.5rem;
 }
 
 .header h1 {
@@ -29,6 +33,133 @@ body {
   font-size: 1.5rem;
   font-weight: 600;
   color: #e8b4bc;
+}
+
+.header-user {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.header-username {
+  font-size: 0.9rem;
+  color: #c9a0b8;
+}
+
+.logout-btn {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.85rem;
+  border: 1px solid #4a2c4a;
+  border-radius: 8px;
+  background: transparent;
+  color: #c9a0b8;
+  cursor: pointer;
+}
+
+.logout-btn:hover {
+  background: rgba(74, 44, 74, 0.3);
+}
+
+/* Auth pages (login / signup) */
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 2rem;
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 16px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.auth-card h1 {
+  margin: 0 0 0.25rem 0;
+  font-size: 1.75rem;
+  color: #e8b4bc;
+}
+
+.auth-subtitle {
+  margin: 0 0 1.5rem 0;
+  font-size: 0.95rem;
+  color: #888;
+}
+
+.auth-card form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.auth-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.9rem;
+  color: #c9a0b8;
+}
+
+.auth-card input {
+  padding: 0.75rem 1rem;
+  font-size: 1rem;
+  border: 1px solid #444;
+  border-radius: 10px;
+  background: #1a1a2e;
+  color: #eee;
+  outline: none;
+}
+
+.auth-card input:focus {
+  border-color: #e8b4bc;
+}
+
+.auth-error {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #e88;
+}
+
+.auth-btn {
+  padding: 0.75rem 1.25rem;
+  font-size: 1rem;
+  font-weight: 600;
+  border: none;
+  border-radius: 10px;
+  background: #c9a0b8;
+  color: #1a1a2e;
+  cursor: pointer;
+  margin-top: 0.25rem;
+}
+
+.auth-btn:hover:not(:disabled) {
+  background: #e8b4bc;
+}
+
+.auth-btn:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.auth-switch {
+  margin: 1.25rem 0 0 0;
+  font-size: 0.9rem;
+  color: #888;
+  text-align: center;
+}
+
+.auth-switch a {
+  color: #e8b4bc;
+  text-decoration: none;
+}
+
+.auth-switch a:hover {
+  text-decoration: underline;
 }
 
 .messages {
