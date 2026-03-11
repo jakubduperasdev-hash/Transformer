@@ -1,7 +1,6 @@
 """
 Backend API for the romantic chatbot.
-Frontend sends chat content; 
-API returns the bot's reply.
+Chat history is stored per user (session_id) in SQLite.
 """
 from contextlib import asynccontextmanager
 
@@ -9,24 +8,27 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import db
 
 # --- Request/Response models ---
 
 class ChatRequest(BaseModel):
     message: str
     history: list[dict[str, str]] | None = None
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     reply: str
     history: list[dict[str, str]]
+    session_id: str
 
 
 # --- App ---
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Model is loaded on first import of romatic_chatbot; nothing else to do here
+    db.init_db()
     yield
 
 
@@ -51,22 +53,46 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/history")
+def get_history(session_id: str = ""):
+    """Return chat history for the given session_id (for restoring after refresh)."""
+    if not session_id or not session_id.strip():
+        return {"history": []}
+    return {"history": db.get_history(session_id.strip())}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def post_chat(body: ChatRequest):
-    """Receive the user's message (and optional history), return the bot's reply and updated history."""
+    """Receive the user's message and session_id; load/save history in DB; return reply."""
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
     try:
         from romatic_chatbot import chat
-        history, reply = chat(body.message.strip(), history=body.history)
-        return ChatResponse(reply=reply, history=history)
-    except ImportError as e:
+    except ImportError:
         raise HTTPException(
             status_code=503,
-            detail="Chat model not available. Install torch and transformers: pip install torch transformers",
+            detail="Chat model not available. Install torch and transformers.",
         )
+    # Load history from DB (ignore body.history so DB is source of truth)
+    history = db.get_history(session_id)
+    if not history:
+        history = None  # let chatbot set system prompt
+    try:
+        history, reply = chat(body.message.strip(), history=history)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    # Persist user message and assistant reply
+    db.append_messages(
+        session_id,
+        [
+            {"role": "user", "content": body.message.strip()},
+            {"role": "assistant", "content": reply},
+        ],
+    )
+    return ChatResponse(reply=reply, history=history, session_id=session_id)
 
 
 if __name__ == "__main__":
