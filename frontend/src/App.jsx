@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 
 const API_BASE = "/api";
 
@@ -7,10 +7,15 @@ export default function App() {
   const [history, setHistory] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const messagesEndRef = useRef(null);
 
   const messages = history
     ? history.filter((m) => m.role !== "system")
     : [];
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length, loading]);
 
   async function handleSend() {
     const text = input.trim();
@@ -71,6 +76,7 @@ export default function App() {
             <p className="message-content typing">...</p>
           </div>
         )}
+        <div ref={messagesEndRef} aria-hidden="true" />
       </div>
 
       {error && <p className="error">{error}</p>}
