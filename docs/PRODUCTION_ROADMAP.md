@@ -148,3 +148,30 @@ Below is why, and what to change.
 5. **Add production ops**: health checks, rate limiting, structured logging, metrics, secrets manager.
 
 If you want, next step can be a **concrete checklist** (per file or per component) for this repo (e.g. “replace SQLite with PostgreSQL here”, “add tenant_id here”, “add /export and /delete-user here”) so the project can be evolved step by step toward this target.
+
+---
+
+## 7. Implemented in this repo
+
+The following production-oriented features are **already implemented** in this codebase:
+
+| Area | Implemented |
+|------|-------------|
+| **Database** | PostgreSQL supported when `DATABASE_URL` is set; SQLite fallback. Connection check in health. |
+| **Tenants** | `tenants` table; `users.tenant_id`; default tenant; tenant isolation for usage. |
+| **Usage / billing** | `tenant_daily_usage` (per tenant, per day: `request_count`, `token_count`). `record_usage()` called after each chat. |
+| **Audit log** | `audit_log(tenant_id, user_id, action, details)` for login, export, delete, etc. |
+| **GDPR** | `DELETE /api/users/me` (right to erasure), `GET /api/users/me/export` (data portability). |
+| **Rate limiting** | Per-user limits; **Redis** when `REDIS_URL` is set, in-memory otherwise. Config: `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW`. |
+| **Health** | `GET /api/health`: DB check; when `INFERENCE_API_URL` is set, inference check (503 if inference down). |
+| **Logging** | Request-ID middleware, structured JSON logs. |
+| **Inference** | Optional **external** inference: set `INFERENCE_API_URL` (OpenAI-compatible or vLLM/TGI). API uses `inference_client` when set; otherwise local `romatic_chatbot`. |
+| **Graceful shutdown** | Lifespan shutdown logs and brief drain delay. |
+
+**Still optional / future**
+
+- **Redis** for rate limiting: set `REDIS_URL` to use it.
+- **Metrics**: Prometheus/OpenMetrics endpoint and dashboards (not yet added).
+- **Secrets manager** and JWT rotation (env is in place; rotation not implemented).
+- **Refresh tokens** and short-lived access tokens (only single JWT today).
+- **Queue + workers** if you run in-house inference (API can call external API or local model; no queue in repo).

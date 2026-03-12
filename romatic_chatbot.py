@@ -1,6 +1,9 @@
+import os
 import torch
 from threading import Thread
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+MAX_REPLY_TOKENS = int(os.environ.get("MAX_REPLY_TOKENS", "512"))
 
 # Pick an instruct/chat model (small example; use what fits your GPU)
 model_id = "Qwen/Qwen2.5-0.5B-Instruct"  # or "meta-llama/Meta-Llama-3-8B-Instruct", etc.
@@ -51,7 +54,7 @@ def chat(user_message: str, history: list = None) -> tuple[list, str]:
     with torch.no_grad():
         out = model.generate(
             **inputs,
-            max_new_tokens=256,
+            max_new_tokens=MAX_REPLY_TOKENS,
             do_sample=True,
             temperature=0.8,
             pad_token_id=tokenizer.eos_token_id,
@@ -94,7 +97,7 @@ def chat_stream(user_message: str, history: list = None):
     )
     gen_kwargs = {
         **inputs,
-        "max_new_tokens": 256,
+        "max_new_tokens": MAX_REPLY_TOKENS,
         "do_sample": True,
         "temperature": 0.8,
         "pad_token_id": tokenizer.eos_token_id,

@@ -1,3 +1,6 @@
+# Environment and secrets (copy env.example to .env and edit)
+.env
+
 # SQLite chat history (per-environment)
 chat_history.db
 

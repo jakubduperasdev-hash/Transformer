@@ -2,3 +2,8 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 passlib>=1.7.4
 pyjwt>=2.7.0
+python-dotenv>=1.0.0
+# For PostgreSQL (set DATABASE_URL=postgresql://...)
+psycopg2-binary>=2.9.0
+# Optional: for distributed rate limiting (set REDIS_URL)
+redis>=5.0.0
