@@ -389,11 +389,16 @@ def health():
 
 
 @api.get("/history")
-def get_history(current_user: dict = Depends(get_current_user)):
-    """Return chat history for the logged-in user."""
+def get_history(
+    current_user: dict = Depends(get_current_user),
+    limit: int = 20,
+    before_id: int | None = None,
+):
+    """Return chat history for the logged-in user. Paginated: initial load gets recent messages; use before_id to load older (e.g. on scroll up)."""
     check_rate_limit(int(current_user["id"]))
-    history = db.get_history_by_user(current_user["id"])
-    return {"history": history}
+    limit = min(max(1, limit), 100)
+    history, has_more = db.get_history_paginated(int(current_user["id"]), limit=limit, before_id=before_id)
+    return {"history": history, "has_more": has_more}
 
 
 def _strip_incomplete_list_item(text: str) -> str:

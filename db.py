@@ -672,6 +672,55 @@ def get_history_by_user(user_id: int) -> list[dict[str, str]]:
         conn_impl.close()
 
 
+def get_history_paginated(
+    user_id: int,
+    limit: int = 10,
+    before_id: int | None = None,
+) -> tuple[list[dict], bool]:
+    """
+    Return (messages, has_more). Messages are chronological (oldest first).
+    - before_id=None: return the most recent `limit` messages (so initial load is fast).
+    - before_id set: return up to `limit` messages older than that id (for "load more" on scroll up).
+    Each message has id, role, content.
+    """
+    conn_impl = get_connection()
+    try:
+        if _is_pg():
+            if before_id is None:
+                cur = conn_impl.execute(
+                    "SELECT id, role, content FROM user_messages WHERE user_id = %s ORDER BY id DESC LIMIT %s",
+                    (user_id, limit + 1),
+                )
+            else:
+                cur = conn_impl.execute(
+                    "SELECT id, role, content FROM user_messages WHERE user_id = %s AND id < %s ORDER BY id DESC LIMIT %s",
+                    (user_id, before_id, limit + 1),
+                )
+            rows = cur.fetchall()
+        else:
+            conn_impl._conn.row_factory = sqlite3.Row
+            if before_id is None:
+                cur = conn_impl.execute(
+                    "SELECT id, role, content FROM user_messages WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+                    (user_id, limit + 1),
+                )
+            else:
+                cur = conn_impl.execute(
+                    "SELECT id, role, content FROM user_messages WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                    (user_id, before_id, limit + 1),
+                )
+            rows = cur.fetchall()
+        items = [_row_to_dict(r) for r in rows]
+        has_more = len(items) > limit
+        if has_more:
+            items = items[:limit]
+        # Reverse so chronological (oldest first) for display
+        items = list(reversed(items))
+        return items, has_more
+    finally:
+        conn_impl.close()
+
+
 def append_messages_for_user(user_id: int, messages: list[dict[str, str]]) -> None:
     if not messages:
         return
