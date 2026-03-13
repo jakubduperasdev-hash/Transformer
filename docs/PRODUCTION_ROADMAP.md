@@ -165,13 +165,36 @@ The following production-oriented features are **already implemented** in this c
 | **Rate limiting** | Per-user limits; **Redis** when `REDIS_URL` is set, in-memory otherwise. Config: `RATE_LIMIT_REQUESTS`, `RATE_LIMIT_WINDOW`. |
 | **Health** | `GET /api/health`: DB check; when `INFERENCE_API_URL` is set, inference check (503 if inference down). |
 | **Logging** | Request-ID middleware, structured JSON logs. |
-| **Inference** | Optional **external** inference: set `INFERENCE_API_URL` (OpenAI-compatible or vLLM/TGI). API uses `inference_client` when set; otherwise local `romatic_chatbot`. |
+| **Inference** | Optional **external** inference: set `INFERENCE_API_URL` (OpenAI-compatible or vLLM/TGI). API uses `inference_client` when set; otherwise local `romatic_chatbot`. Retries and circuit breaker when using external inference. |
 | **Graceful shutdown** | Lifespan shutdown logs and brief drain delay. |
+| **Per-tenant quotas** | Optional daily token/request limits per tenant (`TENANT_DAILY_TOKEN_LIMIT`, `TENANT_DAILY_REQUEST_LIMIT`). Enforced before chat/stream; 429 when exceeded. |
+| **DB connection pooling** | PostgreSQL uses `ThreadedConnectionPool` when `DATABASE_URL` is set (`PG_POOL_MIN`, `PG_POOL_MAX`). |
+| **Metrics** | `GET /metrics` exposes Prometheus counters: `http_requests_total`, `http_request_duration_seconds_*`, `chat_tokens_total`, `chat_errors_total`. |
+| **Refresh tokens** | Login returns short-lived access token (default 15 min) and refresh token (7 days). `POST /api/refresh` exchanges refresh token for new access token. |
+| **Consent / lawful basis** | Optional `consent_at` and `lawful_basis` on register; stored on user and included in GDPR export. |
 
 **Still optional / future**
 
 - **Redis** for rate limiting: set `REDIS_URL` to use it.
-- **Metrics**: Prometheus/OpenMetrics endpoint and dashboards (not yet added).
 - **Secrets manager** and JWT rotation (env is in place; rotation not implemented).
-- **Refresh tokens** and short-lived access tokens (only single JWT today).
 - **Queue + workers** if you run in-house inference (API can call external API or local model; no queue in repo).
+- **Frontend**: use refresh token to obtain new access token on 401 (e.g. call `POST /api/refresh` and retry).
+
+---
+
+## 8. Assessment: European SaaS at 80M+ tokens/day
+
+**With external inference (e.g. vLLM) and the features above in place, this project is in good shape for a European SaaS that aims to handle 80M+ tokens/day.**
+
+| Dimension | Status |
+|-----------|--------|
+| **Scale** | API is separate from inference; use vLLM/TGI (or managed) with batching and GPU. PostgreSQL + pooling; optional Redis for rate limits across instances. Run multiple API instances behind a load balancer. |
+| **Reliability** | Rate limits, per-tenant quotas, health (DB + inference), retries and circuit breaker for inference, metrics, graceful shutdown. |
+| **Compliance** | GDPR: delete, export, audit log, consent/lawful basis; tenant isolation and usage metering. |
+| **Security** | Short-lived access tokens, refresh tokens, env-based secrets. |
+
+**Response time measurement**
+
+- **Local model**: `python benchmark_chat.py` measures cold/warm response time for the in-process chatbot (no API).
+- **API (simulated)**: `python benchmark_api_response_time.py` sends real HTTP requests to `POST /api/chat`, reports **average**, **p50**, and **p95** response time. Use `--base-url` and `--requests` as needed. Requires the API to be running and a working chat backend (local model or `INFERENCE_API_URL`).
+- **Production**: `GET /metrics` exposes `http_request_duration_seconds_sum` and `_count` per path; from Prometheus you can compute average (and percentiles if you use a histogram in the future).

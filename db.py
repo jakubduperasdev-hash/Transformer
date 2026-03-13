@@ -17,15 +17,33 @@ DEFAULT_TENANT_ID = 1
 try:
     import psycopg2
     import psycopg2.extras
+    from psycopg2.pool import ThreadedConnectionPool
 except ImportError:
     psycopg2 = None
+    ThreadedConnectionPool = None
+
+_PG_POOL = None
+PG_POOL_MIN = int(os.environ.get("PG_POOL_MIN", "2"))
+PG_POOL_MAX = int(os.environ.get("PG_POOL_MAX", "20"))
+
+
+def _get_pg_pool():
+    global _PG_POOL
+    if _PG_POOL is None and DATABASE_URL and DATABASE_URL.startswith("postgresql") and psycopg2 and ThreadedConnectionPool:
+        _PG_POOL = ThreadedConnectionPool(PG_POOL_MIN, PG_POOL_MAX, DATABASE_URL)
+    return _PG_POOL
 
 
 def get_connection():
     if DATABASE_URL and DATABASE_URL.startswith("postgresql") and psycopg2:
+        pool = _get_pg_pool()
+        if pool:
+            conn = pool.getconn()
+            conn.autocommit = False
+            return _PGConnection(conn, pool)
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
-        return _PGConnection(conn)
+        return _PGConnection(conn, None)
     return _SQLiteConnection(sqlite3.connect(DB_PATH))
 
 
@@ -50,8 +68,9 @@ class _SQLiteConnection:
 
 
 class _PGConnection:
-    def __init__(self, conn):
+    def __init__(self, conn, pool=None):
         self._conn = conn
+        self._pool = pool
         self._param = "%s"
 
     def execute(self, sql: str, params: tuple = ()):
@@ -64,7 +83,14 @@ class _PGConnection:
         self._conn.commit()
 
     def close(self):
-        self._conn.close()
+        if self._pool:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            self._pool.putconn(self._conn)
+        else:
+            self._conn.close()
 
     def lastrowid(self, cur) -> int:
         return cur.fetchone() or cur.lastrowid
@@ -135,6 +161,8 @@ def _init_sqlite(conn_impl):
         """
     )
     _ensure_column_sqlite(conn, "users", "tenant_id", "INTEGER DEFAULT 1")
+    _ensure_column_sqlite(conn, "users", "consent_at", "TEXT")
+    _ensure_column_sqlite(conn, "users", "lawful_basis", "TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS user_messages (
@@ -171,6 +199,17 @@ def _init_sqlite(conn_impl):
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash)")
     conn.commit()
 
 
@@ -179,6 +218,14 @@ def _ensure_column_sqlite(conn, table: str, column: str, col_type: str):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     except sqlite3.OperationalError:
         pass
+
+
+def _ensure_column_pg(cur, table: str, column: str, col_type: str):
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+    except Exception as e:
+        if getattr(e, "pgcode", None) != "42701":  # duplicate_column
+            raise
 
 
 def _init_pg(conn_impl):
@@ -205,6 +252,8 @@ def _init_pg(conn_impl):
             )
             """
         )
+        _ensure_column_pg(cur, "users", "consent_at", "TIMESTAMPTZ")
+        _ensure_column_pg(cur, "users", "lawful_basis", "TEXT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_messages (
@@ -240,9 +289,89 @@ def _init_pg(conn_impl):
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refresh_tokens (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_refresh_tokens_hash ON refresh_tokens(token_hash)")
     finally:
         cur.close()
     conn_impl.commit()
+
+
+# --- Refresh tokens ---
+
+def _hash_refresh_token(plain: str) -> str:
+    import hashlib
+    return hashlib.sha256(plain.encode("utf-8")).hexdigest()
+
+
+def create_refresh_token(user_id: int, expires_at: str) -> str:
+    """Create a refresh token for user; store hash. Returns plain token (store in client)."""
+    import secrets
+    plain = secrets.token_urlsafe(32)
+    token_hash = _hash_refresh_token(plain)
+    conn_impl = get_connection()
+    try:
+        if _is_pg():
+            conn_impl.execute(
+                "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (%s, %s, %s)",
+                (user_id, token_hash, expires_at),
+            )
+        else:
+            conn_impl.execute(
+                "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+                (user_id, token_hash, expires_at),
+            )
+        conn_impl.commit()
+        return plain
+    finally:
+        conn_impl.close()
+
+
+def get_user_by_refresh_token(plain_token: str) -> dict | None:
+    """Return user dict if valid refresh token and not expired; else None. Does not consume token."""
+    token_hash = _hash_refresh_token(plain_token)
+    now = datetime.now(timezone.utc).isoformat()
+    conn_impl = get_connection()
+    try:
+        if _is_pg():
+            cur = conn_impl.execute(
+                "SELECT u.id, u.tenant_id, u.username, u.email FROM users u "
+                "JOIN refresh_tokens r ON r.user_id = u.id WHERE r.token_hash = %s AND r.expires_at > %s",
+                (token_hash, now),
+            )
+        else:
+            conn_impl._conn.row_factory = sqlite3.Row
+            cur = conn_impl.execute(
+                "SELECT u.id, u.tenant_id, u.username, u.email FROM users u "
+                "JOIN refresh_tokens r ON r.user_id = u.id WHERE r.token_hash = ? AND r.expires_at > ?",
+                (token_hash, now),
+            )
+        row = cur.fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn_impl.close()
+
+
+def revoke_refresh_token(plain_token: str) -> None:
+    """Remove refresh token (e.g. on logout or rotation)."""
+    token_hash = _hash_refresh_token(plain_token)
+    conn_impl = get_connection()
+    try:
+        if _is_pg():
+            conn_impl.execute("DELETE FROM refresh_tokens WHERE token_hash = %s", (token_hash,))
+        else:
+            conn_impl.execute("DELETE FROM refresh_tokens WHERE token_hash = ?", (token_hash,))
+        conn_impl.commit()
+    finally:
+        conn_impl.close()
 
 
 # --- Tenants ---
@@ -303,22 +432,29 @@ def audit_log(tenant_id: int, user_id: int | None, action: str, details: str | N
 
 # --- Users ---
 
-def create_user(username: str, email: str, password_hash: str, tenant_id: int = DEFAULT_TENANT_ID) -> int:
+def create_user(
+    username: str,
+    email: str,
+    password_hash: str,
+    tenant_id: int = DEFAULT_TENANT_ID,
+    consent_at: str | None = None,
+    lawful_basis: str | None = None,
+) -> int:
     now = datetime.now(timezone.utc).isoformat()
     conn_impl = get_connection()
     try:
         if _is_pg():
             cur = conn_impl.execute(
-                "INSERT INTO users (tenant_id, username, email, password_hash, created_at) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (tenant_id, username.strip(), email.strip().lower(), password_hash, now),
+                "INSERT INTO users (tenant_id, username, email, password_hash, created_at, consent_at, lawful_basis) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (tenant_id, username.strip(), email.strip().lower(), password_hash, now, consent_at, lawful_basis),
             )
             row = cur.fetchone()
             conn_impl.commit()
             return int(row["id"]) if row else None
         else:
             cur = conn_impl.execute(
-                "INSERT INTO users (tenant_id, username, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                (tenant_id, username.strip(), email.strip().lower(), password_hash, now),
+                "INSERT INTO users (tenant_id, username, email, password_hash, created_at, consent_at, lawful_basis) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (tenant_id, username.strip(), email.strip().lower(), password_hash, now, consent_at, lawful_basis),
             )
             conn_impl.commit()
             return cur.lastrowid
@@ -388,14 +524,17 @@ def get_user_by_id(user_id: int) -> dict | None:
     try:
         if _is_pg():
             cur = conn_impl.execute(
-                "SELECT id, tenant_id, username, email FROM users WHERE id = %s",
+                "SELECT id, tenant_id, username, email, consent_at, lawful_basis FROM users WHERE id = %s",
                 (user_id,),
             )
             row = cur.fetchone()
             return dict(row) if row else None
         else:
             conn_impl._conn.row_factory = sqlite3.Row
-            cur = conn_impl.execute("SELECT id, tenant_id, username, email FROM users WHERE id = ?", (user_id,))
+            cur = conn_impl.execute(
+                "SELECT id, tenant_id, username, email, consent_at, lawful_basis FROM users WHERE id = ?",
+                (user_id,),
+            )
             row = cur.fetchone()
             return _row_to_dict(row) if row else None
     finally:
@@ -430,12 +569,46 @@ def export_user_data(user_id: int) -> dict | None:
     user = get_user_by_id(user_id)
     if not user:
         return None
-    user_export = {"id": user["id"], "username": user["username"], "email": user["email"]}
+    user_export = {
+        "id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "consent_at": user.get("consent_at"),
+        "lawful_basis": user.get("lawful_basis"),
+    }
     history = get_history_by_user(user_id)
     return {"user": user_export, "messages": history, "exported_at": datetime.now(timezone.utc).isoformat()}
 
 
 # --- Per-tenant usage (billing) ---
+
+def get_tenant_daily_usage(tenant_id: int) -> tuple[int, int]:
+    """Return (request_count, token_count) for the tenant today. (0, 0) if no row."""
+    from datetime import date
+    today = date.today().isoformat()
+    conn_impl = get_connection()
+    try:
+        if _is_pg():
+            cur = conn_impl.execute(
+                "SELECT request_count, token_count FROM tenant_daily_usage WHERE tenant_id = %s AND date = %s",
+                (tenant_id, today),
+            )
+        else:
+            conn_impl._conn.row_factory = sqlite3.Row
+            cur = conn_impl.execute(
+                "SELECT request_count, token_count FROM tenant_daily_usage WHERE tenant_id = ? AND date = ?",
+                (tenant_id, today),
+            )
+        row = cur.fetchone()
+        if not row:
+            return 0, 0
+        r = _row_to_dict(row) if row is not None else {}
+        req = r.get("request_count", 0) if isinstance(r, dict) else (row[0] if len(row) > 0 else 0)
+        tok = r.get("token_count", 0) if isinstance(r, dict) else (row[1] if len(row) > 1 else 0)
+        return int(req or 0), int(tok or 0)
+    finally:
+        conn_impl.close()
+
 
 def record_usage(tenant_id: int, request_delta: int = 1, token_delta: int = 0) -> None:
     """Increment tenant daily usage for billing. Call after each chat."""

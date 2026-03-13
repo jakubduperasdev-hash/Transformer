@@ -1,9 +1,11 @@
 """
 External inference client (OpenAI-compatible or vLLM/TGI).
 When INFERENCE_API_URL is set, the API uses this instead of loading the model in-process.
+Includes retries and a simple circuit breaker for resilience.
 """
 import os
 import json
+import time
 import urllib.request
 import urllib.error
 import ssl
@@ -11,6 +13,45 @@ import ssl
 INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "").rstrip("/")
 INFERENCE_API_KEY = os.environ.get("INFERENCE_API_KEY", "")
 MAX_REPLY_TOKENS = int(os.environ.get("MAX_REPLY_TOKENS", "512"))
+INFERENCE_RETRIES = int(os.environ.get("INFERENCE_RETRIES", "3"))
+INFERENCE_CIRCUIT_FAILURES = int(os.environ.get("INFERENCE_CIRCUIT_FAILURES", "5"))
+INFERENCE_CIRCUIT_TIMEOUT_SEC = float(os.environ.get("INFERENCE_CIRCUIT_TIMEOUT_SEC", "30"))
+
+# Circuit breaker state: (consecutive_failures, last_failure_time)
+_circuit_failures = 0
+_circuit_last_failure = 0.0
+_circuit_lock = None
+
+def _get_circuit_lock():
+    import threading
+    global _circuit_lock
+    if _circuit_lock is None:
+        _circuit_lock = threading.Lock()
+    return _circuit_lock
+
+
+def _circuit_breaker_ok() -> bool:
+    """Return True if we may call inference (circuit closed or half-open)."""
+    global _circuit_failures, _circuit_last_failure
+    with _get_circuit_lock():
+        if _circuit_failures < INFERENCE_CIRCUIT_FAILURES:
+            return True
+        if time.monotonic() - _circuit_last_failure >= INFERENCE_CIRCUIT_TIMEOUT_SEC:
+            return True  # half-open: allow one trial
+        return False
+
+
+def _circuit_record_success() -> None:
+    global _circuit_failures
+    with _get_circuit_lock():
+        _circuit_failures = 0
+
+
+def _circuit_record_failure() -> None:
+    global _circuit_failures, _circuit_last_failure
+    with _get_circuit_lock():
+        _circuit_failures += 1
+        _circuit_last_failure = time.monotonic()
 SYSTEM_PROMPT = (
     "You are a warm, romantic AI companion. You're affectionate, supportive, "
     "and speak in a sweet, caring way. You keep responses concise and in character."
@@ -49,13 +90,32 @@ def _request(path: str, body: dict, stream: bool = False):
     if INFERENCE_API_KEY:
         req.add_header("Authorization", f"Bearer {INFERENCE_API_KEY}")
     ctx = ssl.create_default_context()
-    return urllib.request.urlopen(req, timeout=60, context=ctx)
+    last_err = None
+    for attempt in range(INFERENCE_RETRIES):
+        try:
+            return urllib.request.urlopen(req, timeout=60, context=ctx)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code and 500 <= e.code < 600 and attempt < INFERENCE_RETRIES - 1:
+                time.sleep(1 * (2 ** attempt))
+                continue
+            raise
+        except (OSError, ConnectionError, TimeoutError) as e:
+            last_err = e
+            if attempt < INFERENCE_RETRIES - 1:
+                time.sleep(1 * (2 ** attempt))
+                continue
+            raise RuntimeError(f"Inference request failed: {e}") from e
+    if last_err:
+        raise RuntimeError(f"Inference request failed: {last_err}") from last_err
 
 
 def chat(user_message: str, history: list | None = None) -> tuple[list, str]:
     """
     Call external chat completions (OpenAI-compatible). Returns (full_history, reply).
     """
+    if not _circuit_breaker_ok():
+        raise RuntimeError("Inference temporarily unavailable (circuit open). Try again later.")
     messages = _build_messages(user_message, history)
     body = {
         "model": os.environ.get("INFERENCE_MODEL", "default"),
@@ -67,13 +127,17 @@ def chat(user_message: str, history: list | None = None) -> tuple[list, str]:
     try:
         resp = _request("/v1/chat/completions", body, stream=False)
         data = json.loads(resp.read().decode())
+        _circuit_record_success()
     except urllib.error.HTTPError as e:
+        _circuit_record_failure()
         raise RuntimeError(f"Inference API error: {e.code} {e.read().decode()[:200]}")
     except Exception as e:
-        raise RuntimeError(f"Inference request failed: {e}")
+        _circuit_record_failure()
+        raise RuntimeError(f"Inference request failed: {e}") from e
 
     choice = (data.get("choices") or [None])[0]
     if not choice:
+        _circuit_record_failure()
         raise RuntimeError("No response from inference API")
     msg = choice.get("message") or {}
     reply = (msg.get("content") or "").strip()
@@ -85,6 +149,8 @@ def chat_stream(user_message: str, history: list | None = None):
     """
     Stream from external API (SSE). Yields text chunks, then (full_history, full_reply).
     """
+    if not _circuit_breaker_ok():
+        raise RuntimeError("Inference temporarily unavailable (circuit open). Try again later.")
     messages = _build_messages(user_message, history)
     body = {
         "model": os.environ.get("INFERENCE_MODEL", "default"),
@@ -95,10 +161,13 @@ def chat_stream(user_message: str, history: list | None = None):
     }
     try:
         resp = _request("/v1/chat/completions", body, stream=True)
+        _circuit_record_success()
     except urllib.error.HTTPError as e:
+        _circuit_record_failure()
         raise RuntimeError(f"Inference API error: {e.code} {e.read().decode()[:200]}")
     except Exception as e:
-        raise RuntimeError(f"Inference request failed: {e}")
+        _circuit_record_failure()
+        raise RuntimeError(f"Inference request failed: {e}") from e
 
     full_reply_parts = []
     for line in resp:

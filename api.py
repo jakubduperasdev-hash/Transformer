@@ -8,6 +8,7 @@ load_dotenv()  # load .env before db reads DATABASE_URL
 
 import json
 import re
+import threading
 import time
 import logging
 import uuid
@@ -15,7 +16,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -30,6 +31,8 @@ log = logging.getLogger(__name__)
 # --- Auth config ---
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
 JWT_ALGORITHM = "HS256"
+JWT_ACCESS_EXPIRY_MINUTES = int(os.environ.get("JWT_ACCESS_EXPIRY_MINUTES", "15"))
+JWT_REFRESH_DAYS = int(os.environ.get("JWT_REFRESH_DAYS", "7"))
 pwd_ctx = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
@@ -37,6 +40,9 @@ security = HTTPBearer(auto_error=False)
 RATE_LIMIT_REQUESTS = int(os.environ.get("RATE_LIMIT_REQUESTS", "120"))
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 REDIS_URL = os.environ.get("REDIS_URL")
+# Per-tenant daily quotas (0 = no limit). Enforced before chat/stream.
+TENANT_DAILY_TOKEN_LIMIT = int(os.environ.get("TENANT_DAILY_TOKEN_LIMIT", "0"))
+TENANT_DAILY_REQUEST_LIMIT = int(os.environ.get("TENANT_DAILY_REQUEST_LIMIT", "0"))
 _rate_store: dict = {}
 
 _redis_client = None
@@ -84,6 +90,48 @@ def check_rate_limit(user_id: int) -> None:
     if count > RATE_LIMIT_REQUESTS:
         raise HTTPException(status_code=429, detail="Too many requests; try again later.")
 
+
+def check_tenant_quota(tenant_id: int) -> None:
+    """Raise 429 if tenant has exceeded daily token or request quota."""
+    if TENANT_DAILY_TOKEN_LIMIT <= 0 and TENANT_DAILY_REQUEST_LIMIT <= 0:
+        return
+    req_count, token_count = db.get_tenant_daily_usage(tenant_id)
+    if TENANT_DAILY_REQUEST_LIMIT > 0 and req_count >= TENANT_DAILY_REQUEST_LIMIT:
+        raise HTTPException(status_code=429, detail="Daily request quota exceeded for your organization.")
+    if TENANT_DAILY_TOKEN_LIMIT > 0 and token_count >= TENANT_DAILY_TOKEN_LIMIT:
+        raise HTTPException(status_code=429, detail="Daily token quota exceeded for your organization.")
+
+
+# --- Metrics (Prometheus) ---
+_metrics_lock = threading.Lock()
+_http_requests: dict[tuple[str, str, int], int] = {}  # (method, path, status) -> count
+_http_duration_sum: dict[tuple[str, str], float] = {}  # (method, path) -> sum seconds
+_http_duration_count: dict[tuple[str, str], int] = {}
+_chat_tokens_total: int = 0
+_chat_errors_total: int = 0
+
+
+def _record_request(method: str, path: str, status: int, duration_sec: float) -> None:
+    with _metrics_lock:
+        key = (method, path, status)
+        _http_requests[key] = _http_requests.get(key, 0) + 1
+        key_d = (method, path)
+        _http_duration_sum[key_d] = _http_duration_sum.get(key_d, 0) + duration_sec
+        _http_duration_count[key_d] = _http_duration_count.get(key_d, 0) + 1
+
+
+def record_chat_tokens(tokens: int) -> None:
+    with _metrics_lock:
+        global _chat_tokens_total
+        _chat_tokens_total += tokens
+
+
+def record_chat_error() -> None:
+    with _metrics_lock:
+        global _chat_errors_total
+        _chat_errors_total += 1
+
+
 # --- Request/Response models ---
 
 class RegisterRequest(BaseModel):
@@ -91,11 +139,17 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     tenant_id: int | None = None  # optional; if provided, user joins this tenant (must exist)
+    consent_at: str | None = None  # optional; ISO timestamp when user gave consent (GDPR)
+    lawful_basis: str | None = None  # optional; e.g. "consent", "contract", "legitimate_interest" (GDPR)
 
 
 class LoginRequest(BaseModel):
     username: str  # or email
     password: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 class ChatRequest(BaseModel):
@@ -140,13 +194,15 @@ async def request_id_and_log(request: Request, call_next):
     request.state.request_id = request_id
     start = time.time()
     response = await call_next(request)
+    duration = time.time() - start
+    _record_request(request.method, request.url.path, response.status_code, duration)
     log.info(
         json.dumps({
             "request_id": request_id,
             "method": request.method,
             "path": request.url.path,
             "status": response.status_code,
-            "duration_ms": round((time.time() - start) * 1000),
+            "duration_ms": round(duration * 1000),
         })
     )
     response.headers["X-Request-ID"] = request_id
@@ -207,8 +263,15 @@ def register(body: RegisterRequest):
         password_hash = pwd_ctx.hash(password)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Password hashing failed")
+    consent_at = (body.consent_at or "").strip() or None
+    lawful_basis = (body.lawful_basis or "").strip() or None
     try:
-        user_id = db.create_user(username, email, password_hash, tenant_id=tenant_id)
+        user_id = db.create_user(
+            username, email, password_hash,
+            tenant_id=tenant_id,
+            consent_at=consent_at,
+            lawful_basis=lawful_basis,
+        )
     except Exception as e:
         err = str(e).lower()
         if "unique" in err or "duplicate" in err or "integrity" in err:
@@ -217,9 +280,20 @@ def register(body: RegisterRequest):
     return {"id": int(user_id), "username": username, "email": email}
 
 
+def _make_access_token(user_id: int) -> tuple[str, int]:
+    """Return (jwt_string, expires_in_seconds)."""
+    from datetime import datetime, timezone, timedelta
+    exp = datetime.now(timezone.utc) + timedelta(minutes=JWT_ACCESS_EXPIRY_MINUTES)
+    payload = {"sub": str(user_id), "exp": exp}
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+    return token, JWT_ACCESS_EXPIRY_MINUTES * 60
+
+
 @api.post("/login")
 def login(body: LoginRequest):
-    """Return a JWT and user info. Use the token in Authorization: Bearer <token>."""
+    """Return short-lived access token, refresh token, and user info. Use access token in Authorization: Bearer <token>."""
     identifier = (body.username or "").strip()
     password = body.password or ""
     if not identifier or not password:
@@ -233,21 +307,40 @@ def login(body: LoginRequest):
     if not pwd_ctx.verify(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     try:
-        token = jwt.encode(
-            {"sub": str(user["id"])},
-            JWT_SECRET,
-            algorithm=JWT_ALGORITHM,
-        )
+        access_token, expires_in = _make_access_token(int(user["id"]))
+        from datetime import datetime, timezone, timedelta
+        refresh_expires = (datetime.now(timezone.utc) + timedelta(days=JWT_REFRESH_DAYS)).isoformat()
+        refresh_token = db.create_refresh_token(int(user["id"]), refresh_expires)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Token creation failed")
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
     tenant_id = user.get("tenant_id") or db.DEFAULT_TENANT_ID
     db.audit_log(tenant_id, int(user["id"]), "login", None)
     return {
-        "token": token,
+        "token": access_token,
+        "refresh_token": refresh_token,
+        "expires_in": expires_in,
         "user": {"id": int(user["id"]), "username": str(user["username"]), "email": str(user["email"])},
     }
+
+
+@api.post("/refresh")
+def refresh(body: RefreshRequest):
+    """Exchange a valid refresh_token for a new access token. Optional: pass refresh_token in body to rotate."""
+    plain = (body.refresh_token or "").strip()
+    if not plain:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+    user = db.get_user_by_refresh_token(plain)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+    try:
+        access_token, expires_in = _make_access_token(int(user["id"]))
+        # Optional rotation: issue new refresh token and revoke old (uncomment to enable)
+        # new_refresh = db.create_refresh_token(int(user["id"]), (datetime.now(timezone.utc) + timedelta(days=JWT_REFRESH_DAYS)).isoformat())
+        # db.revoke_refresh_token(plain)
+        # return {"token": access_token, "refresh_token": new_refresh, "expires_in": expires_in}
+        return {"token": access_token, "expires_in": expires_in}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Token creation failed")
 
 
 @api.get("/me")
@@ -327,18 +420,21 @@ def _run_chat(user_message: str, history: list | None) -> tuple[list, str]:
 def post_chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
     """Send a message and get a reply. History is loaded/saved for the logged-in user."""
     check_rate_limit(int(current_user["id"]))
+    tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
+    check_tenant_quota(tenant_id)
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
     user_id = current_user["id"]
-    tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
     history = db.get_history_by_user(user_id)
     if not history:
         history = None
     try:
         history, reply = _run_chat(body.message.strip(), history=history)
     except ImportError:
+        record_chat_error()
         raise HTTPException(status_code=503, detail="Chat not available. Set INFERENCE_API_URL or install torch and transformers.")
     except Exception as e:
+        record_chat_error()
         raise HTTPException(status_code=500, detail=str(e))
     reply = _strip_incomplete_list_item(reply)
     if history:
@@ -352,6 +448,7 @@ def post_chat(body: ChatRequest, current_user: dict = Depends(get_current_user))
     )
     approx_tokens = (len(body.message) + len(reply)) // 4
     db.record_usage(tenant_id, request_delta=1, token_delta=approx_tokens)
+    record_chat_tokens(approx_tokens)
     return ChatResponse(reply=reply, history=history)
 
 
@@ -371,10 +468,11 @@ def _run_chat_stream(user_message: str, history: list | None):
 def post_chat_stream(body: ChatRequest, current_user: dict = Depends(get_current_user)):
     """Stream the reply token-by-token (NDJSON: each line is {"chunk": "..."} or {"done": true, "history": [...]})."""
     check_rate_limit(int(current_user["id"]))
+    tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
+    check_tenant_quota(tenant_id)
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
     user_id = current_user["id"]
-    tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
     history = db.get_history_by_user(user_id)
     if not history:
         history = None
@@ -396,12 +494,15 @@ def post_chat_stream(body: ChatRequest, current_user: dict = Depends(get_current
                     )
                     approx_tokens = (len(body.message.strip()) + len(full_reply)) // 4
                     db.record_usage(tenant_id, request_delta=1, token_delta=approx_tokens)
+                    record_chat_tokens(approx_tokens)
                     yield json.dumps({"done": True, "history": full_history}) + "\n"
                 else:
                     yield json.dumps({"chunk": value}) + "\n"
         except ImportError:
+            record_chat_error()
             yield json.dumps({"error": "Chat not available. Set INFERENCE_API_URL or install torch and transformers."}) + "\n"
         except Exception as e:
+            record_chat_error()
             yield json.dumps({"error": str(e)}) + "\n"
 
     return StreamingResponse(
@@ -412,6 +513,42 @@ def post_chat_stream(body: ChatRequest, current_user: dict = Depends(get_current
 
 
 app.include_router(api)
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    """Prometheus metrics for latency, request counts, and chat tokens."""
+    with _metrics_lock:
+        lines = [
+            "# HELP http_requests_total Total HTTP requests by method, path, status.",
+            "# TYPE http_requests_total counter",
+        ]
+        for (method, path, status), count in sorted(_http_requests.items()):
+            m, p, s = method.replace('"', '\\"'), path.replace('"', '\\"'), status
+            lines.append(f'http_requests_total{{method="{m}",path="{p}",status="{s}"}} {count}')
+        lines.extend([
+            "# HELP http_request_duration_seconds_sum Sum of request durations by method, path.",
+            "# TYPE http_request_duration_seconds_sum counter",
+        ])
+        for (method, path), s in sorted(_http_duration_sum.items()):
+            m, p = method.replace('"', '\\"'), path.replace('"', '\\"')
+            lines.append(f'http_request_duration_seconds_sum{{method="{m}",path="{p}"}} {s:.6f}')
+        lines.extend([
+            "# HELP http_request_duration_seconds_count Request count by method, path.",
+            "# TYPE http_request_duration_seconds_count counter",
+        ])
+        for (method, path), c in sorted(_http_duration_count.items()):
+            m, p = method.replace('"', '\\"'), path.replace('"', '\\"')
+            lines.append(f'http_request_duration_seconds_count{{method="{m}",path="{p}"}} {c}')
+        lines.extend([
+            "# HELP chat_tokens_total Total tokens used in chat (approximate).",
+            "# TYPE chat_tokens_total counter",
+            f"chat_tokens_total {_chat_tokens_total}",
+            "# HELP chat_errors_total Total chat request errors.",
+            "# TYPE chat_errors_total counter",
+            f"chat_errors_total {_chat_errors_total}",
+        ])
+    return "\n".join(lines) + "\n"
 
 
 @app.exception_handler(Exception)
