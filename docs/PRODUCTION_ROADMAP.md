@@ -24,6 +24,35 @@ Below is why, and what to change.
 | **API** | One FastAPI app, no queue | All requests hit the model directly; under load you get timeouts and no backpressure. |
 | **Deployment** | Single machine implied | No horizontal scaling, no separation of API vs inference. |
 
+**Internal inference: how many tokens per day can one instance handle?**
+
+With **in-process (internal) inference**—one API process loading the model (e.g. Qwen2.5-0.5B) and serving one request at a time:
+
+| Scenario | Replies/min | Tokens/turn (approx) | Tokens/day (one process) |
+|----------|-------------|----------------------|--------------------------|
+| CPU, ~4 s/reply | ~15 | ~150–200 | **~3–4 M** |
+| CPU, ~3 s/reply | ~20 | ~150–200 | **~4–5 M** |
+| GPU (faster) | ~40–80+ | ~150–200 | **~8–15 M** (order of magnitude) |
+
+So with **internal inference**, a **single instance can realistically handle on the order of ~3–5 million tokens per day on CPU**, or **~10–15 M tokens/day on a single GPU** (model- and hardware-dependent). To reach **80 M tokens/day** with internal inference you’d need **~5–20+ processes** (each with its own model in memory), i.e. many machines or heavy GPU servers—usually not cost-effective compared to a dedicated inference service (vLLM/TGI) with batching.
+
+**Internal inference: how many users at the same time?**
+
+In this app, inference runs **one request at a time per process** (no batching). So:
+
+| Setup | Concurrent users served |
+|-------|---------------------------|
+| **1 API process** (default `python api.py` or `uvicorn` with 1 worker) | **1** — only one user gets a reply at a time; others wait in queue. |
+| **N workers** (e.g. `uvicorn api:app --workers 4`) | **N** — up to N users get a reply at the same time, but each worker loads its own model (**N× memory**). |
+
+So with internal inference the company can handle **1 concurrent user per process**. More concurrent users require more workers (and more RAM/GPU for duplicate models). Many users can be *logged in* or have the app open at once; the limit is how many chat requests are **being answered simultaneously** (1 per process).
+
+**Example: 1000 users at the same time with internal inference**
+
+- You would need **1000 processes** (or workers) so that each of the 1000 users gets one process and a reply at the same time.
+- **Response time per user** would still be **~3–4 s** (on CPU) per reply—each process handles one request, so there is no extra queue delay for that user.
+- The blocker is **resources**: 1000 processes ⇒ 1000 copies of the model in memory (e.g. ~1–2 GB per process for a 0.5B model on CPU ⇒ **~1–2 TB RAM**). That is not practical. So internal inference does not scale to hundreds or thousands of concurrent users; use **external inference** (vLLM/TGI, etc.) with batching instead.
+
 **Direction for production**
 
 - **Separate inference from API**

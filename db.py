@@ -220,11 +220,13 @@ def _ensure_column_sqlite(conn, table: str, column: str, col_type: str):
         pass
 
 
-def _ensure_column_pg(cur, table: str, column: str, col_type: str):
+def _ensure_column_pg(conn, cur, table: str, column: str, col_type: str):
     try:
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
     except Exception as e:
-        if getattr(e, "pgcode", None) != "42701":  # duplicate_column
+        if getattr(e, "pgcode", None) == "42701":  # duplicate_column
+            conn.rollback()
+        else:
             raise
 
 
@@ -252,8 +254,8 @@ def _init_pg(conn_impl):
             )
             """
         )
-        _ensure_column_pg(cur, "users", "consent_at", "TIMESTAMPTZ")
-        _ensure_column_pg(cur, "users", "lawful_basis", "TEXT")
+        _ensure_column_pg(conn, cur, "users", "consent_at", "TIMESTAMPTZ")
+        _ensure_column_pg(conn, cur, "users", "lawful_basis", "TEXT")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS user_messages (

@@ -56,6 +56,10 @@ SYSTEM_PROMPT = (
     "You are a warm, romantic AI companion. You're affectionate, supportive, "
     "and speak in a sweet, caring way. You keep responses concise and in character."
 )
+# Cap history length to avoid very long requests and high latency (0 = no limit).
+INFERENCE_MAX_HISTORY_MESSAGES = int(os.environ.get("INFERENCE_MAX_HISTORY_MESSAGES", "0"))
+# When truncating, keep this many messages from the start so user preferences are not dropped.
+INFERENCE_KEEP_FIRST_MESSAGES = int(os.environ.get("INFERENCE_KEEP_FIRST_MESSAGES", "4"))
 
 
 def use_external() -> bool:
@@ -69,9 +73,20 @@ def _build_messages(user_message: str, history: list | None) -> list[dict]:
             {"role": "user", "content": user_message},
         ]
     messages = list(history)
-    if messages[0].get("role") != "system":
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-    messages.append({"role": "user", "content": user_message})
+    if messages[0].get("role") == "system":
+        system_msg = [messages[0]]
+        rest = messages[1:]
+    else:
+        system_msg = [{"role": "system", "content": SYSTEM_PROMPT}]
+        rest = messages
+    if INFERENCE_MAX_HISTORY_MESSAGES > 0 and len(rest) > INFERENCE_MAX_HISTORY_MESSAGES:
+        keep_first = min(INFERENCE_KEEP_FIRST_MESSAGES, INFERENCE_MAX_HISTORY_MESSAGES)
+        tail_size = INFERENCE_MAX_HISTORY_MESSAGES - keep_first
+        if tail_size <= 0:
+            rest = rest[:INFERENCE_MAX_HISTORY_MESSAGES]
+        else:
+            rest = rest[:keep_first] + rest[-tail_size:]
+    messages = system_msg + rest + [{"role": "user", "content": user_message}]
     return messages
 
 

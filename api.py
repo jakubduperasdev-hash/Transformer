@@ -404,6 +404,32 @@ def _strip_incomplete_list_item(text: str) -> str:
     return re.sub(r"\n\s*\d+[.)]?\s*$", "", text).rstrip()
 
 
+# Cap history length to reduce latency for long conversations (0 = no limit). Applies to internal and external inference.
+CHAT_MAX_HISTORY_MESSAGES = int(os.environ.get("CHAT_MAX_HISTORY_MESSAGES", "0"))
+# When truncating, keep this many messages from the start (so user preferences / "how I like to chat" are not dropped).
+CHAT_KEEP_FIRST_MESSAGES = int(os.environ.get("CHAT_KEEP_FIRST_MESSAGES", "4"))
+
+
+def _truncate_history(history: list | None) -> list | None:
+    """Cap to CHAT_MAX_HISTORY_MESSAGES but keep the first CHAT_KEEP_FIRST_MESSAGES so preferences aren't lost. Full history still in DB."""
+    if not history or CHAT_MAX_HISTORY_MESSAGES <= 0:
+        return history
+    if history[0].get("role") == "system":
+        system_part = [history[0]]
+        rest = history[1:]
+    else:
+        system_part = []
+        rest = history
+    if len(rest) <= CHAT_MAX_HISTORY_MESSAGES:
+        return history
+    keep_first = min(CHAT_KEEP_FIRST_MESSAGES, CHAT_MAX_HISTORY_MESSAGES)
+    tail_size = CHAT_MAX_HISTORY_MESSAGES - keep_first
+    if tail_size <= 0:
+        return system_part + rest[:CHAT_MAX_HISTORY_MESSAGES]
+    # First K messages (preferences / early context) + last (N - K) messages (recent context).
+    return system_part + rest[:keep_first] + rest[-tail_size:]
+
+
 def _run_chat(user_message: str, history: list | None) -> tuple[list, str]:
     """Use external inference if INFERENCE_API_URL set, else local model."""
     try:
@@ -416,37 +442,56 @@ def _run_chat(user_message: str, history: list | None) -> tuple[list, str]:
     return chat(user_message, history)
 
 
+def _orchestrator():
+    """Lazy singleton for Agent Orchestrator (Prompt Builder, Memory, Tools, Planning -> LLM Core)."""
+    try:
+        from agent import AgentOrchestrator
+        return AgentOrchestrator()
+    except ImportError:
+        return None
+
+
+AGENT_ORCHESTRATOR_ENABLED = os.environ.get("AGENT_ORCHESTRATOR_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+
 @api.post("/chat", response_model=ChatResponse)
 def post_chat(body: ChatRequest, current_user: dict = Depends(get_current_user)):
-    """Send a message and get a reply. History is loaded/saved for the logged-in user."""
+    """Send a message and get a reply. Uses Agent Orchestrator when AGENT_ORCHESTRATOR_ENABLED=1."""
     check_rate_limit(int(current_user["id"]))
     tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
     check_tenant_quota(tenant_id)
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
     user_id = current_user["id"]
-    history = db.get_history_by_user(user_id)
-    if not history:
-        history = None
+    msg = body.message.strip()
     try:
-        history, reply = _run_chat(body.message.strip(), history=history)
+        if AGENT_ORCHESTRATOR_ENABLED:
+            orch = _orchestrator()
+            if orch:
+                history, reply = orch.chat(user_id, msg)
+            else:
+                history = _truncate_history(db.get_history_by_user(user_id))
+                history, reply = _run_chat(msg, history=history)
+                reply = _strip_incomplete_list_item(reply)
+                if history:
+                    history = history[:-1] + [{"role": "assistant", "content": reply}]
+                db.append_messages_for_user(user_id, [{"role": "user", "content": msg}, {"role": "assistant", "content": reply}])
+        else:
+            history = _truncate_history(db.get_history_by_user(user_id))
+            if not history:
+                history = None
+            history, reply = _run_chat(msg, history=history)
+            reply = _strip_incomplete_list_item(reply)
+            if history:
+                history = history[:-1] + [{"role": "assistant", "content": reply}]
+            db.append_messages_for_user(user_id, [{"role": "user", "content": msg}, {"role": "assistant", "content": reply}])
     except ImportError:
         record_chat_error()
         raise HTTPException(status_code=503, detail="Chat not available. Set INFERENCE_API_URL or install torch and transformers.")
     except Exception as e:
         record_chat_error()
         raise HTTPException(status_code=500, detail=str(e))
-    reply = _strip_incomplete_list_item(reply)
-    if history:
-        history = history[:-1] + [{"role": "assistant", "content": reply}]
-    db.append_messages_for_user(
-        user_id,
-        [
-            {"role": "user", "content": body.message.strip()},
-            {"role": "assistant", "content": reply},
-        ],
-    )
-    approx_tokens = (len(body.message) + len(reply)) // 4
+    approx_tokens = (len(msg) + len(reply)) // 4
     db.record_usage(tenant_id, request_delta=1, token_delta=approx_tokens)
     record_chat_tokens(approx_tokens)
     return ChatResponse(reply=reply, history=history)
@@ -466,33 +511,44 @@ def _run_chat_stream(user_message: str, history: list | None):
 
 @api.post("/chat/stream")
 def post_chat_stream(body: ChatRequest, current_user: dict = Depends(get_current_user)):
-    """Stream the reply token-by-token (NDJSON: each line is {"chunk": "..."} or {"done": true, "history": [...]})."""
+    """Stream the reply token-by-token (NDJSON: each line is {"chunk": "..."} or {"done": true, "history": [...]}). Uses Agent Orchestrator when AGENT_ORCHESTRATOR_ENABLED=1."""
     check_rate_limit(int(current_user["id"]))
     tenant_id = current_user.get("tenant_id") or db.DEFAULT_TENANT_ID
     check_tenant_quota(tenant_id)
     if not body.message or not body.message.strip():
         raise HTTPException(status_code=400, detail="message must be non-empty")
     user_id = current_user["id"]
-    history = db.get_history_by_user(user_id)
-    if not history:
-        history = None
+    msg = body.message.strip()
 
     def generate():
         try:
-            for value in _run_chat_stream(body.message.strip(), history=history):
+            if AGENT_ORCHESTRATOR_ENABLED:
+                orch = _orchestrator()
+                if orch:
+                    for value in orch.chat_stream(user_id, msg):
+                        if isinstance(value, tuple):
+                            full_history, full_reply = value
+                            full_reply = _strip_incomplete_list_item(full_reply)
+                            if full_history:
+                                full_history = full_history[:-1] + [{"role": "assistant", "content": full_reply}]
+                            approx_tokens = (len(msg) + len(full_reply)) // 4
+                            db.record_usage(tenant_id, request_delta=1, token_delta=approx_tokens)
+                            record_chat_tokens(approx_tokens)
+                            yield json.dumps({"done": True, "history": full_history}) + "\n"
+                        else:
+                            yield json.dumps({"chunk": value}) + "\n"
+                    return
+            history = _truncate_history(db.get_history_by_user(user_id))
+            if not history:
+                history = None
+            for value in _run_chat_stream(msg, history=history):
                 if isinstance(value, tuple):
                     full_history, full_reply = value
                     full_reply = _strip_incomplete_list_item(full_reply)
                     if full_history:
                         full_history = full_history[:-1] + [{"role": "assistant", "content": full_reply}]
-                    db.append_messages_for_user(
-                        user_id,
-                        [
-                            {"role": "user", "content": body.message.strip()},
-                            {"role": "assistant", "content": full_reply},
-                        ],
-                    )
-                    approx_tokens = (len(body.message.strip()) + len(full_reply)) // 4
+                    db.append_messages_for_user(user_id, [{"role": "user", "content": msg}, {"role": "assistant", "content": full_reply}])
+                    approx_tokens = (len(msg) + len(full_reply)) // 4
                     db.record_usage(tenant_id, request_delta=1, token_delta=approx_tokens)
                     record_chat_tokens(approx_tokens)
                     yield json.dumps({"done": True, "history": full_history}) + "\n"
